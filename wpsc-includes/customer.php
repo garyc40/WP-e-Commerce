@@ -496,7 +496,7 @@ function _wpsc_get_customer_wp_user_id() {
 				}
 			}
 		} else {
-			$user_id = $existing_user->ID;
+			$user_id = $create_user_result;
 
 			$wordpress_user = new WP_User( $user_id );
 
