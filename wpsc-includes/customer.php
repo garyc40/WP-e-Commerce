@@ -491,7 +491,7 @@ function _wpsc_get_customer_wp_user_id() {
 
 				$how_long_ago = time() - $user_registered_time;
 
-				if ( $how_long_ago < 5 ) { // users created with within 5 seconds are treated as this user
+				if ( $how_long_ago < 10 ) { // users created with within 10 seconds are treated as this user
 					$user_id = $existing_user->ID;
 				}
 			}
