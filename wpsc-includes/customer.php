@@ -34,54 +34,34 @@ function wpsc_create_customer_id() {
 	static $cached_current_customer_id = false;
 	global $wp_roles;
 
-	if ( $cached_current_customer_id !== false ) {
-		return $cached_current_customer_id;
-	}
+	if ( $cached_current_customer_id === false ) {
 
-	if ( $is_a_bot_user = wpsc_is_bot_user() ) {
-		$username = '_wpsc_bot';
-		$wp_user = get_user_by( 'login', $username );
-		if ( $wp_user === false ) {
-			$password = wp_generate_password( 12, false );
-			$id = wp_create_user( $username, $password );
+		if ( $is_a_bot_user = wpsc_is_bot_user() ) {
+			$username = '_wpsc_bot';
+			$wp_user = get_user_by( 'login', $username );
+			if ( $wp_user === false ) {
+				$password = wp_generate_password( 12, false );
+				$id = wp_create_user( $username, $password );
+			} else {
+				$id = $wp_user->ID;
+			}
 		} else {
-			$id = $wp_user->ID;
+			$id = _wpsc_get_customer_wp_user_id();
+
+			$expire = time() + WPSC_CUSTOMER_DATA_EXPIRATION; // valid for 48 hours
+			$data = $id . $expire;
+			$hash = hash_hmac( 'md5', $data, wp_hash( $data ) );
+			$cookie = $id . '|' . $expire . '|' . $hash;
+
+			// store ID, expire and hash to validate later
+			_wpsc_set_customer_cookie( $cookie, $expire );
+
 		}
-	} else {
-		if ( !($id =_wpsc_recently_created_user()) ) {
-			$username = '_' . wp_generate_password( 8, false, false );
-			$password = wp_generate_password( 12, false );
 
-			$role = $wp_roles->get_role( 'wpsc_anonymous' );
-
-			if ( ! $role )
-				$wp_roles->add_role( 'wpsc_anonymous', __( 'Anonymous', 'wpsc' ) );
-
-			$id = wp_create_user( $username, $password );
-			$user = new WP_User( $id );
-			$user->set_role( 'wpsc_anonymous' );
-
-			update_user_meta( $id, '_wpsc_last_active', time() );
-			update_user_meta( $id, '_wpsc_temporary_profile', 48 ); // 48 hours, cron job to delete will tick once per hour
-			update_user_meta( $id, _wpsc_user_hash_meta_key(), microtime( true ) );
-		}
+		$cached_current_customer_id = $id;
 	}
 
-
-	// set cookie for all live users
-	if ( !wpsc_is_bot_user() ) {
-		$expire = time() + WPSC_CUSTOMER_DATA_EXPIRATION; // valid for 48 hours
-		$data = $id . $expire;
-		$hash = hash_hmac( 'md5', $data, wp_hash( $data ) );
-		$cookie = $id . '|' . $expire . '|' . $hash;
-
-		// store ID, expire and hash to validate later
-		_wpsc_set_customer_cookie( $cookie, $expire );
-	}
-
-	$cached_current_customer_id = $id;
-
-	return $id;
+	return $cached_current_customer_id;
 }
 
 /**
@@ -366,6 +346,12 @@ function wpsc_is_bot_user() {
 		return true;
 	}
 
+	// a cron request from a uri?
+	if ( strpos( $_SERVER['REQUEST_URI'], 'wp-cron.php' ) ) {
+		$is_a_bot_user = true;
+		return true;
+	}
+
 	// even web servers talk to themselves when they think no one is listening
 	if ( stripos( $_SERVER['HTTP_USER_AGENT'], 'wordpress' ) !== false ) {
 		$is_a_bot_user = true;
@@ -379,7 +365,8 @@ function wpsc_is_bot_user() {
 			( stripos( $_SERVER['HTTP_USER_AGENT'], 'bot' ) !== false )
 				|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'crawler' ) !== false )
 					|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'spider' ) !== false )
-						|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'Preview' ) !== false )
+						|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'preview' ) !== false )
+							|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'squider' ) !== false )
 		) ) {
 		$is_a_bot_user = true;
 		return true;
@@ -483,24 +470,60 @@ function _wpsc_user_hash_meta_key() {
  * @access private
  * @since  3.8.13
  */
-function _wpsc_recently_created_user() {
-	global $wpdb;
+function _wpsc_get_customer_wp_user_id() {
+	global $wp_roles;
 
-	$recently_created_user_id = false;
+	$user_name_prefix       = '_' . _wpsc_user_hash_meta_key();
+	$user_name_suffix       = '';
+	$user_name_check_count  = 0;
+	$password               = wp_generate_password( 12, false );
+	$user_id                = false;
 
-	$sql = 'SELECT user_id, meta_value FROM ' . $wpdb->usermeta . ' WHERE meta_key = "' . _wpsc_user_hash_meta_key() . '"';
+	while( $user_id === false) {
+		$user_name_to_look_for = $user_name_prefix . $user_name_suffix;
+		$create_user_result = wp_create_user( $user_name_to_look_for, $password );
 
-	$similiar_users = $wpdb->get_results( $sql );
+		if ( is_wp_error($create_user_result) ) {
+			if ( $create_user_result->get_error_code() == 'existing_user_login' ) {
+				$existing_user = get_user_by( 'login', $user_name_to_look_for );
 
-	$now = microtime( true );
-	foreach ( $similiar_users as $similiar_user ) {
-		$then = floatval( $similiar_user->meta_value );
-		$howlong = $now - $then;
-		if ( $howlong < 0.5 ) { // one half second
-			$recently_created_user_id = $similiar_user->user_id;
-			break;
+				$user_registered_time = strtotime( $existing_user->user_registered );
+
+				$how_long_ago = time() - $user_registered_time;
+
+				if ( $how_long_ago < 5 ) { // users created with within 5 seconds are treated as this user
+					$user_id = $existing_user->ID;
+				}
+			}
+		} else {
+			$user_id = $existing_user->ID;
+
+			$wordpress_user = new WP_User( $user_id );
+
+			// we created a user, let's do some initialization
+			$role = $wp_roles->get_role( 'wpsc_anonymous' );
+
+			if ( ! $role )
+				$wp_roles->add_role( 'wpsc_anonymous', __( 'Anonymous', 'wpsc' ) );
+
+			$wordpress_user->set_role( 'wpsc_anonymous' );
+
+			update_user_meta( $user_id, '_wpsc_last_active', time() );
+			update_user_meta( $user_id, '_wpsc_temporary_profile', 48 ); // 48 hours, cron job to delete will tick once per hour
+
+			do_action( 'wpsc_created_user_profile', $user_id , $wordpress_user );
+
 		}
+
+		$user_name_check_count++;
+
+		// this should never happen, but infinite loops are really bad so we'll check anyway
+		if ( $user_name_check_count > 1000 )
+			exit(0);
+
+		$user_name_suffix = ('_' . $user_name_check_count);
 	}
 
-	return $recently_created_user_id;
+	return $user_id;
+
 }
