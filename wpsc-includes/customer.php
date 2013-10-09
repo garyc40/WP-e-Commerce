@@ -299,6 +299,9 @@ function wpsc_get_all_customer_meta( $id = false ) {
 function _wpsc_update_customer_last_active() {
 	$id = wpsc_get_current_customer_id();
 	update_user_meta( $id, '_wpsc_last_active', time() );
+
+	// if this is a temporary user reset the ticker for how long the temporary profile
+	// is kept before purging
 	$meta_value = get_user_meta($id, '_wpsc_temporary_profile', true);
 	if ( !empty( $meta_value ) )
 		update_user_meta( $id, '_wpsc_temporary_profile', 48 );
@@ -367,6 +370,7 @@ function wpsc_is_bot_user() {
 					|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'spider' ) !== false )
 						|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'preview' ) !== false )
 							|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'squider' ) !== false )
+								|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'slurp' ) !== false )
 		) ) {
 		$is_a_bot_user = true;
 		return true;
@@ -472,6 +476,7 @@ function _wpsc_user_hash_meta_key() {
  */
 function _wpsc_get_customer_wp_user_id() {
 	global $wp_roles;
+	global $wpdb;
 
 	$user_name_prefix       = '_' . _wpsc_user_hash_meta_key();
 	$user_name_suffix       = '';
@@ -480,10 +485,14 @@ function _wpsc_get_customer_wp_user_id() {
 	$user_id                = false;
 
 	while( $user_id === false) {
+		$result = $wpdb->query('START TRANSACTION');
 		$user_name_to_look_for = $user_name_prefix . $user_name_suffix;
 		$create_user_result = wp_create_user( $user_name_to_look_for, $password );
 
 		if ( is_wp_error($create_user_result) ) {
+			// end the transaction we started above
+			$result = $wpdb->query('ROLLBACK');
+
 			if ( $create_user_result->get_error_code() == 'existing_user_login' ) {
 				$existing_user = get_user_by( 'login', $user_name_to_look_for );
 
@@ -493,12 +502,14 @@ function _wpsc_get_customer_wp_user_id() {
 
 				if ( $how_long_ago < 10 ) { // users created with within 10 seconds are treated as this user
 					$user_id = $existing_user->ID;
+				} else {
+					$user_name_check_count++;
+					$user_name_suffix = ('_' . $user_name_check_count);
 				}
 			}
 		} else {
-			$user_id = $create_user_result;
 
-			$wordpress_user = new WP_User( $user_id );
+			$wordpress_user = new WP_User( $create_user_result );
 
 			// we created a user, let's do some initialization
 			$role = $wp_roles->get_role( 'wpsc_anonymous' );
@@ -508,20 +519,35 @@ function _wpsc_get_customer_wp_user_id() {
 
 			$wordpress_user->set_role( 'wpsc_anonymous' );
 
-			update_user_meta( $user_id, '_wpsc_last_active', time() );
-			update_user_meta( $user_id, '_wpsc_temporary_profile', 48 ); // 48 hours, cron job to delete will tick once per hour
+			update_user_meta( $create_user_result, '_wpsc_last_active', time() );
+			// we set the delete ticker low knowing it will be set to a bigger number on the first user
+			// action.  this will cause profiles that only a single page view to be deleted sooner
+			// uncluttering our user table and cache.
+			update_user_meta( $create_user_result, '_wpsc_temporary_profile', 2 );
 
-			do_action( 'wpsc_created_user_profile', $user_id , $wordpress_user );
+			// At this point we check to see if there is more than one user with our user login name.  This can happen
+			// because although Wordpress requires that login names are unique, however Wordpress doesn't enforce the
+			// requirement with a unique restriction on the column index.  If two requests from the same user come in
+			// at close to the same time both insert user requests can succeed. The two requests can be any combination
+			// of get requests for the page's html, ajax requests, or http get/post requests processing forms.
 
+			$sql = 'SELECT count(*) FROM ' . $wpdb->users . ' WHERE user_login = "' . $wordpress_user->user_login . '"';
+			$user_count = $wpdb->get_var( $sql );
+
+			// if there is only one user all is well and we can commit the transaction, otherwise try again
+			if ( $user_count == 1 ) {
+				$user_id = $create_user_result;
+				$result = $wpdb->query('COMMIT');
+				do_action( 'wpsc_created_user_profile', $user_id , $wordpress_user );
+			} else {
+				$result = $wpdb->query('ROLLBACK');
+			}
 		}
 
-		$user_name_check_count++;
-
 		// this should never happen, but infinite loops are really bad so we'll check anyway
-		if ( $user_name_check_count > 1000 )
+		if ( $user_name_check_count > 100 )
 			exit(0);
 
-		$user_name_suffix = ('_' . $user_name_check_count);
 	}
 
 	return $user_id;
