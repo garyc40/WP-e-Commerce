@@ -371,6 +371,7 @@ function wpsc_is_bot_user() {
 						|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'preview' ) !== false )
 							|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'squider' ) !== false )
 								|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'slurp' ) !== false )
+									|| ( stripos( $_SERVER['HTTP_USER_AGENT'], 'pinterest.com' ) !== false )
 		) ) {
 		$is_a_bot_user = true;
 		return true;
@@ -481,13 +482,30 @@ function _wpsc_get_customer_wp_user_id() {
 	$user_name_prefix       = '_' . _wpsc_user_hash_meta_key();
 	$user_name_suffix       = '';
 	$user_name_check_count  = 0;
+	$avoid_infinite_loop    = 0;
 	$password               = wp_generate_password( 12, false );
 	$user_id                = false;
 
 	while( $user_id === false) {
+
+		// this should never happen, but infinite loops are really bad so we'll check anyway
+		if ( $avoid_infinite_loop++ > 100 )
+			exit(0);
+
 		$result = $wpdb->query('START TRANSACTION');
 		$user_name_to_look_for = $user_name_prefix . $user_name_suffix;
-		$create_user_result = wp_create_user( $user_name_to_look_for, $password );
+
+		// start our transaction by going directly to the database and checking to see that the user doesn't exist
+		// we don't use the wordpress user check functions because another process could be somehwere between
+		/// adding the  user to the database and updating the internal user cache
+		$sql = 'SELECT count(*) FROM ' . $wpdb->users . ' WHERE user_login = "' . $user_name_to_look_for . '"';
+		$user_count = $wpdb->get_var( $sql );
+
+		if ( $user_count == 0 ) {
+			$create_user_result = wp_create_user( $user_name_to_look_for, $password );
+		} else {
+			$create_user_result = new WP_Error('existing_user_login', __("user already exits as determined by direct sql query") );
+		}
 
 		if ( is_wp_error($create_user_result) ) {
 			// end the transaction we started above
@@ -544,9 +562,6 @@ function _wpsc_get_customer_wp_user_id() {
 			}
 		}
 
-		// this should never happen, but infinite loops are really bad so we'll check anyway
-		if ( $user_name_check_count > 100 )
-			exit(0);
 
 	}
 
